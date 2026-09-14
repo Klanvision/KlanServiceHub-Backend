@@ -48,10 +48,22 @@ import deployments from './features/deployments/server/route.js';
 import portfolio from './features/portfolio/server/route.js';
 import search from './features/search/server/route.js';
 import { cacheMiddleware, autoInvalidateCacheMiddleware, cacheStore } from './lib/cache.js';
-
 import { getFrontendUrl } from './lib/config.js';
+import { initOrSyncD1 } from './db.js';
 
 const app = new Hono();
+
+// Cloudflare D1 Database synchronization and hydration middleware
+app.use('*', async (c, next) => {
+  if (c.env && c.env.DB) {
+    try {
+      await initOrSyncD1(c.env.DB, c.executionCtx);
+    } catch (err) {
+      console.error('[D1_MIDDLEWARE_SYNC_ERROR]:', err);
+    }
+  }
+  return next();
+});
 
 app.use('*', async (c, next) => {
   const allowedOrigin = getFrontendUrl(c);
@@ -72,10 +84,33 @@ app.use('*', async (c, next) => {
       return allowedOrigin;
     },
     credentials: true,
-    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization', 'Cookie', 'If-None-Match'],
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+    allowHeaders: [
+      'Content-Type',
+      'Authorization',
+      'authorization',
+      'Cookie',
+      'cookie',
+      'If-None-Match',
+      'x-session-token',
+      'X-Session-Token',
+      'x-auth-token',
+      'X-Auth-Token',
+      'x-workspace-id',
+      'X-Workspace-Id',
+      'x-requested-with',
+      'X-Requested-With',
+      'Accept',
+      'Origin',
+    ],
     exposeHeaders: ['Set-Cookie', 'ETag', 'X-Cache-Status'],
+    maxAge: 86400,
   })(c, next);
+});
+
+// Explicit OPTIONS preflight handler
+app.options('*', (c) => {
+  return c.text('', 204);
 });
 
 // Auto-invalidate cache tags on mutating HTTP requests (POST, PUT, PATCH, DELETE)
