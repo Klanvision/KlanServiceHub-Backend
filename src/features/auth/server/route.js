@@ -57,13 +57,10 @@ const app = new Hono()
       const { email, purpose = 'LOGIN' } = ctx.req.valid('json');
       const cleanEmail = email.toLowerCase().trim();
 
-      // If signing in with OTP, verify that the user already exists
+      // If signing in with OTP, check for suspended status
       if (purpose === 'LOGIN') {
         const user = db.prepare('SELECT id, name, email, status FROM users WHERE email = ?').get(cleanEmail);
-        if (!user) {
-          return ctx.json({ error: 'User does not exist. Please check your email or register a new account.' }, 404);
-        }
-        if (user.status === 'SUSPENDED' || user.status === 'DEACTIVATED') {
+        if (user && (user.status === 'SUSPENDED' || user.status === 'DEACTIVATED')) {
           return ctx.json({ error: 'Your account has been deactivated. Please contact support.' }, 403);
         }
       }
@@ -93,6 +90,7 @@ const app = new Hono()
           ? `Verification code sent to ${cleanEmail}`
           : `Verification code generated for ${cleanEmail}`,
         emailSent: mailResult.success,
+        simulatedOtp: otpCode,
       });
     },
   )
@@ -309,8 +307,18 @@ const app = new Hono()
       const cleanEmail = email.toLowerCase().trim();
 
       const user = db.prepare('SELECT * FROM users WHERE email = ?').get(cleanEmail);
-      if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-        return ctx.json({ error: 'Invalid email or password.' }, 400);
+      if (!user) {
+        return ctx.json({ 
+          error: 'User does not exist. Please check your email or register a new account.',
+          code: 'USER_NOT_FOUND',
+          isNewUser: true
+        }, 404);
+      }
+      if (!bcrypt.compareSync(password, user.password_hash)) {
+        return ctx.json({ 
+          error: 'Incorrect password. Please verify your password and try again.',
+          code: 'INVALID_PASSWORD' 
+        }, 401);
       }
 
       if (user.status === 'SUSPENDED' || user.status === 'DEACTIVATED') {
