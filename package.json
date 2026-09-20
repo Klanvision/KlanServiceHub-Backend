@@ -1,15 +1,13 @@
 {
-  "name": "klanservicehub-backend",
+  "name": "jira-clone-backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
-    "deploy": "npx wrangler deploy",
-    "d1:create": "npx wrangler d1 create klanservicehub_db",
-    "d1:init:local": "npx wrangler d1 execute klanservicehub_db --local --file=cloudflare-d1-schema.sql",
-    "d1:init:remote": "npx wrangler d1 execute klanservicehub_db --remote --file=cloudflare-d1-schema.sql"
+    "deploy:cloudflare": "wrangler deploy",
+    "d1:migrate": "wrangler d1 execute klanservicehub_db --remote --file=cloudflare-d1-schema.sql"
   },
   "dependencies": {
     "@hono/node-server": "^1.13.7",
