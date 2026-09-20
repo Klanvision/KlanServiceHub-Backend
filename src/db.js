@@ -1,15 +1,12 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import fs from 'fs';
-import { fileURLToPath } from 'url';
 import { randomUUID } from 'node:crypto';
 
+// Universal database path resolution (works on Node.js and Cloudflare Workers)
 let dbPath = 'jira.db';
 try {
-  if (typeof import.meta !== 'undefined' && import.meta && typeof import.meta.url === 'string') {
-    const __dirname = path.dirname(fileURLToPath(import.meta.url));
-    dbPath = path.resolve(__dirname, '../jira.db');
-  } else if (typeof process !== 'undefined' && typeof process.cwd === 'function') {
+  if (typeof process !== 'undefined' && process && typeof process.cwd === 'function') {
     dbPath = path.resolve(process.cwd(), 'jira.db');
   }
 } catch (e) {
