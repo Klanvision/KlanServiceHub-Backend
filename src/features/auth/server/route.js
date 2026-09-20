@@ -9,7 +9,7 @@ import { AUTH_COOKIE, SESSION_MAX_AGE_SECONDS, SESSION_MAX_AGE_MS } from '../con
 import { signInFormSchema, signUpFormSchema } from '../schema.js';
 import { sessionMiddleware } from '../../../lib/session-middleware.js';
 import { db, formatDoc, logAudit, ensureWorkspaceDefaults } from '../../../db.js';
-import { sendOtpEmail, sendPasswordResetEmail } from '../../../lib/mail.js';
+import { sendOtpEmail, sendPasswordResetEmail, verifySmtpConnection, sendTestEmail } from '../../../lib/mail.js';
 import { getFrontendUrl } from '../../../lib/config.js';
 
 function setAuthCookie(ctx, sessionSecret) {
@@ -229,7 +229,16 @@ const app = new Hono()
       VALUES (?, ?, ?, ?, 0, 0)
     `).run(randomUUID(), cleanEmail, otpHash, expiresAt);
 
-    return ctx.json({ success: true, message: `Verification code sent to ${cleanEmail}` });
+    const mailResult = await sendOtpEmail({ to: cleanEmail, otpCode });
+
+    return ctx.json({
+      success: true,
+      message: mailResult.success
+        ? `Verification code sent to ${cleanEmail}`
+        : `Verification code generated for ${cleanEmail}`,
+      emailSent: mailResult.success,
+      simulatedOtp: otpCode,
+    });
   })
   .post('/verify-email', async (ctx) => {
     const { email, code, otp } = await ctx.req.json();
@@ -518,11 +527,11 @@ const app = new Hono()
 
       const reset = db.prepare(`
         SELECT * FROM password_resets 
-        WHERE email = ? AND used = 0 AND datetime(expires_at) > datetime('now')
+        WHERE email = ? AND used = 0
         ORDER BY created_at DESC LIMIT 1
       `).get(cleanEmail);
 
-      if (!reset) {
+      if (!reset || (reset.expires_at && new Date(reset.expires_at).getTime() < Date.now())) {
         return ctx.json({ error: 'Reset code has expired or is invalid. Please request a new code.' }, 400);
       }
 
@@ -561,11 +570,11 @@ const app = new Hono()
 
       const reset = db.prepare(`
         SELECT * FROM password_resets 
-        WHERE email = ? AND used = 0 AND datetime(expires_at) > datetime('now')
+        WHERE email = ? AND used = 0
         ORDER BY created_at DESC LIMIT 1
       `).get(cleanEmail);
 
-      if (!reset) {
+      if (!reset || (reset.expires_at && new Date(reset.expires_at).getTime() < Date.now())) {
         return ctx.json({ error: 'Password reset request has expired or is invalid. Please request a new code.' }, 400);
       }
 
@@ -636,6 +645,38 @@ const app = new Hono()
         workspaces,
       },
     });
+  })
+  .get('/verify-smtp', async (ctx) => {
+    try {
+      const res = await verifySmtpConnection();
+      return ctx.json({
+        success: res.success,
+        message: res.message || res.error,
+        smtpHost: process.env.SMTP_HOST || 'smtp.gmail.com',
+        smtpPort: process.env.SMTP_PORT || '587',
+        smtpUser: process.env.SMTP_USER || null,
+        fromEmail: process.env.SMTP_FROM || null,
+      }, res.success ? 200 : 500);
+    } catch (err) {
+      return ctx.json({ success: false, error: err.message }, 500);
+    }
+  })
+  .post('/test-email', async (ctx) => {
+    try {
+      const body = await ctx.req.json().catch(() => ({}));
+      const recipient = body.email || process.env.SMTP_USER;
+      if (!recipient) {
+        return ctx.json({ success: false, error: 'Recipient email is required.' }, 400);
+      }
+      const result = await sendTestEmail({ to: recipient });
+      return ctx.json({
+        success: result.success,
+        recipient,
+        message: result.success ? `Test email dispatched to ${recipient}` : result.error,
+      }, result.success ? 200 : 500);
+    } catch (err) {
+      return ctx.json({ success: false, error: err.message }, 500);
+    }
   })
   .post('/logout', sessionMiddleware, async (ctx) => {
     const sessionSecret = getCookie(ctx, AUTH_COOKIE);
