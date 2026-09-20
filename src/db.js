@@ -4,16 +4,40 @@ import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'node:crypto';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const dbPath = path.resolve(__dirname, '../jira.db');
+let dbPath = 'jira.db';
+try {
+  if (typeof import.meta !== 'undefined' && import.meta && typeof import.meta.url === 'string') {
+    const __dirname = path.dirname(fileURLToPath(import.meta.url));
+    dbPath = path.resolve(__dirname, '../jira.db');
+  } else if (typeof process !== 'undefined' && typeof process.cwd === 'function') {
+    dbPath = path.resolve(process.cwd(), 'jira.db');
+  }
+} catch (e) {
+  dbPath = ':memory:';
+}
 
-export const db = new DatabaseSync(dbPath);
+let databaseInstance;
+try {
+  databaseInstance = new DatabaseSync(dbPath);
+} catch (e) {
+  try {
+    databaseInstance = new DatabaseSync(':memory:');
+  } catch (err) {
+    console.error('Failed to initialize SQLite DatabaseSync:', err);
+  }
+}
 
-// Enable WAL mode, busy timeout, and foreign keys
-db.exec('PRAGMA journal_mode = WAL;');
-db.exec('PRAGMA synchronous = NORMAL;');
-db.exec('PRAGMA busy_timeout = 5000;');
-db.exec('PRAGMA foreign_keys = ON;');
+export const db = databaseInstance;
+
+// Enable WAL mode, busy timeout, and foreign keys safely
+try {
+  db.exec('PRAGMA journal_mode = WAL;');
+  db.exec('PRAGMA synchronous = NORMAL;');
+  db.exec('PRAGMA busy_timeout = 5000;');
+  db.exec('PRAGMA foreign_keys = ON;');
+} catch (e) {
+  // Edge runtime memory DB compatibility
+}
 
 // Helper to safely add column if it doesn't exist
 function safeAddColumn(table, columnDef) {
