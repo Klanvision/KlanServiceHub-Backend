@@ -5,19 +5,18 @@ import { sessionMiddleware } from '../../../lib/session-middleware.js';
 import { db, formatDoc, logAudit, createNotification, ensureWorkspaceDefaults } from '../../../db.js';
 import { broadcastWorkspaceEvent } from '../../../lib/events.js';
 import { sendInvitationEmail } from '../../../lib/mail.js';
-import { getFrontendUrl } from '../../../lib/config.js';
 
 const app = new Hono()
   .get('/token/:token', async (ctx) => {
     const { token } = ctx.req.param();
 
     const invite = db.prepare(`
-      SELECT i.*, COALESCE(w.name, 'Workspace') as organization_name, w.image_url as organization_image,
-             COALESCE(u.name, 'Team Administrator') as inviter_name, u.email as inviter_email,
+      SELECT i.*, w.name as organization_name, w.image_url as organization_image,
+             u.name as inviter_name, u.email as inviter_email,
              p.name as project_name
       FROM invitations i
-      LEFT JOIN workspaces w ON i.organization_id = w.id
-      LEFT JOIN users u ON i.invited_by = u.id
+      JOIN workspaces w ON i.organization_id = w.id
+      JOIN users u ON i.invited_by = u.id
       LEFT JOIN projects p ON i.project_id = p.id
       WHERE i.token_hash = ?
     `).get(token);
@@ -61,15 +60,6 @@ const app = new Hono()
       return ctx.json({ error: 'Invitation not found.' }, 404);
     }
 
-    if (invite.status === 'ACCEPTED') {
-      return ctx.json({
-        success: true,
-        workspaceId: invite.organization_id,
-        projectId: invite.project_id,
-        message: 'Invitation already accepted.',
-      });
-    }
-
     if (invite.status !== 'PENDING') {
       return ctx.json({ error: `This invitation is already ${invite.status.toLowerCase()}.` }, 400);
     }
@@ -91,13 +81,10 @@ const app = new Hono()
       `).run(memberId, invite.organization_id, user.$id, memberRole, invite.organization_role || 'MEMBER');
 
       // Assign system role in roles table
-      let systemRole = db.prepare('SELECT id FROM roles WHERE workspace_id = ? AND name = ?').get(
+      const systemRole = db.prepare('SELECT id FROM roles WHERE workspace_id = ? AND name = ?').get(
         invite.organization_id,
         invite.organization_role === 'COMPANY_ADMIN' ? 'Company Admin' : (invite.organization_role === 'USER_ACCESS_ADMIN' ? 'User Access Admin' : 'Developer')
       );
-      if (!systemRole) {
-        systemRole = db.prepare('SELECT id FROM roles WHERE workspace_id = ? LIMIT 1').get(invite.organization_id);
-      }
       if (systemRole) {
         db.prepare(`
           INSERT OR IGNORE INTO user_roles (id, workspace_id, user_id, role_id)
@@ -133,16 +120,14 @@ const app = new Hono()
       details: { email: invite.email, role: invite.organization_role },
     });
 
-    if (invite.invited_by) {
-      createNotification({
-        workspaceId: invite.organization_id,
-        userId: invite.invited_by,
-        title: 'Invitation Accepted',
-        message: `${user.name || user.email} (${invite.email}) joined your organization.`,
-        link: `/workspaces/${invite.organization_id}/users-admin`,
-        type: 'SYSTEM',
-      });
-    }
+    createNotification({
+      workspaceId: invite.organization_id,
+      userId: invite.invited_by,
+      title: 'Invitation Accepted',
+      message: `${user.name} (${invite.email}) joined your organization.`,
+      link: `/workspaces/${invite.organization_id}/users-admin`,
+      type: 'SYSTEM',
+    });
 
     broadcastWorkspaceEvent(invite.organization_id, 'InvitationAcceptedEvent', {
       userId: user.$id,
@@ -183,20 +168,12 @@ const app = new Hono()
     const { workspaceId } = ctx.req.param();
     const body = await ctx.req.json();
 
+    // Support both batch invitations array: { invitations: [...] } and single invite: { email, ... }
     const items = Array.isArray(body.invitations)
       ? body.invitations
       : [body];
 
     const results = [];
-
-    const generateTempPassword = () => {
-      const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
-      let rand = '';
-      for (let i = 0; i < 6; i++) {
-        rand += chars.charAt(Math.floor(Math.random() * chars.length));
-      }
-      return `Klan@${rand}2026!`;
-    };
 
     for (const item of items) {
       const email = item.email;
@@ -209,52 +186,7 @@ const app = new Hono()
       const orgRole = item.organizationRole || 'MEMBER';
       const projId = item.projectId || null;
       const projRole = item.projectRole || 'MEMBER';
-      const name = item.name || cleanEmail.split('@')[0];
 
-      const memberPassword = item.password && item.password.trim().length >= 6
-        ? item.password.trim()
-        : generateTempPassword();
-      const passwordHash = bcrypt.hashSync(memberPassword, 10);
-
-      // Create or update member user record
-      let existingUser = db.prepare('SELECT id FROM users WHERE email = ?').get(cleanEmail);
-      let userId;
-      if (!existingUser) {
-        userId = randomUUID();
-        db.prepare(`
-          INSERT INTO users (id, name, email, password_hash, job_title, department, onboarding_status, status)
-          VALUES (?, ?, ?, ?, ?, ?, 'ONBOARDING_COMPLETED', 'ACTIVE')
-        `).run(userId, name, cleanEmail, passwordHash, item.jobTitle || 'Team Member', item.department || 'Engineering');
-      } else {
-        userId = existingUser.id;
-        if (item.password) {
-          db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, userId);
-        }
-      }
-
-      // Add or update workspace membership
-      const existingMember = db.prepare('SELECT id FROM members WHERE workspace_id = ? AND user_id = ?').get(workspaceId, userId);
-      if (!existingMember) {
-        const memberId = randomUUID();
-        const role = orgRole === 'COMPANY_ADMIN' ? 'ADMIN' : 'MEMBER';
-        db.prepare(`
-          INSERT INTO members (id, workspace_id, user_id, role, status, organization_role)
-          VALUES (?, ?, ?, ?, 'ACTIVE', ?)
-        `).run(memberId, workspaceId, userId, role, orgRole);
-
-        const systemRole = db.prepare('SELECT id FROM roles WHERE workspace_id = ? AND name = ?').get(
-          workspaceId,
-          orgRole === 'COMPANY_ADMIN' ? 'Company Admin' : (orgRole === 'USER_ACCESS_ADMIN' ? 'User Access Admin' : 'Developer')
-        );
-        if (systemRole) {
-          db.prepare(`
-            INSERT OR IGNORE INTO user_roles (id, workspace_id, user_id, role_id)
-            VALUES (?, ?, ?, ?)
-          `).run(randomUUID(), workspaceId, userId, systemRole.id);
-        }
-      }
-
-      // Record invitation
       db.prepare(`
         INSERT INTO invitations (id, organization_id, email, invited_by, organization_role, project_id, project_role, token_hash, status, expires_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
@@ -267,7 +199,7 @@ const app = new Hono()
         action: 'INVITE_USER',
         entityType: 'INVITATION',
         entityId: inviteId,
-        details: `Invited ${cleanEmail} as ${orgRole} with provisioned account credentials`,
+        details: `Invited ${cleanEmail} as ${orgRole}`,
       });
 
       broadcastWorkspaceEvent(workspaceId, 'UserInvitedEvent', {
@@ -278,28 +210,24 @@ const app = new Hono()
 
       const workspace = db.prepare('SELECT name FROM workspaces WHERE id = ?').get(workspaceId);
       const project = projId ? db.prepare('SELECT name FROM projects WHERE id = ?').get(projId) : null;
-      const frontendUrl = getFrontendUrl(ctx);
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
       const fullInviteUrl = `${frontendUrl}/invite/${token}`;
 
-      const mailResult = await sendInvitationEmail({
+      await sendInvitationEmail({
         to: cleanEmail,
-        inviterName: user.name || 'A team administrator',
+        inviterName: user.name || 'A team member',
         organizationName: workspace?.name || 'Workspace',
         projectName: project?.name,
         role: projRole || orgRole,
         inviteUrl: fullInviteUrl,
-        password: memberPassword,
       });
 
       results.push({
         id: inviteId,
         email: cleanEmail,
         token,
-        password: memberPassword,
         inviteUrl: `/invite/${token}`,
-        fullInviteUrl,
         expiresAt,
-        emailSent: mailResult.success,
       });
     }
 

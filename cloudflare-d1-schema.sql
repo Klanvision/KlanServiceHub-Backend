@@ -1,5 +1,5 @@
 -- =======================================================================
--- CLOUDFLARE D1 / SQLITE MASTER SCHEMA FOR ENTERPRISE TICKETING PLATFORM
+-- CLOUDFLARE D1 / SQLITE MASTER SCHEMA FOR ENTERPRISE JIRA CLONE
 -- Single Master Database Schema File
 -- =======================================================================
 
