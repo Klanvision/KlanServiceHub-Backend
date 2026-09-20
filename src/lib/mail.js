@@ -6,8 +6,60 @@ import nodemailer from 'nodemailer';
  * 1. Cloudflare Workers compatible HTTPS REST APIs (Resend, Brevo, SendGrid)
  * 2. Standard SMTP / Gmail App Password via Nodemailer in Node environments
  */
+function getFromEmail() {
+  const fromEnv = process.env.SMTP_FROM;
+  const userEnv = process.env.SMTP_USER || 'notifications@klanservicehub.dev';
+  if (fromEnv && fromEnv.trim()) {
+    let cleanFrom = fromEnv.trim();
+    if (cleanFrom.startsWith('"') && cleanFrom.endsWith('"') && !cleanFrom.includes('<')) {
+      cleanFrom = cleanFrom.slice(1, -1);
+    }
+    return cleanFrom;
+  }
+  return `"KlanServiceHub" <${userEnv}>`;
+}
+
+function getTransporterOptions() {
+  const user = (process.env.SMTP_USER || '').trim();
+  const pass = (process.env.SMTP_PASS || '').replace(/\s+/g, '');
+  const host = (process.env.SMTP_HOST || 'smtp.gmail.com').trim();
+  const port = Number(process.env.SMTP_PORT) || 587;
+  const secure = process.env.SMTP_SECURE !== undefined
+    ? process.env.SMTP_SECURE === 'true'
+    : port === 465;
+
+  const isGmail = host.toLowerCase().includes('gmail') || process.env.SMTP_SERVICE?.toLowerCase() === 'gmail';
+
+  const transportConfig = {
+    host: isGmail ? 'smtp.gmail.com' : host,
+    port,
+    secure,
+    auth: {
+      user,
+      pass,
+    },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000,
+    tls: {
+      rejectUnauthorized: false,
+    },
+  };
+
+  if (isGmail && port === 587) {
+    transportConfig.requireTLS = true;
+  }
+
+  return { user, pass, transportConfig };
+}
+
+/**
+ * Universal email dispatcher supporting:
+ * 1. Cloudflare Workers compatible HTTPS REST APIs (Resend, Brevo, SendGrid)
+ * 2. Standard SMTP / Gmail App Password via Nodemailer in Node environments
+ */
 async function dispatchEmail({ to, subject, text, html }) {
-  const fromEmail = process.env.SMTP_FROM || `"KlanServiceHub" <${process.env.SMTP_USER || 'notifications@klanservicehub.dev'}>`;
+  const fromEmail = getFromEmail();
 
   // 1. Resend REST API (Cloudflare Workers Native)
   if (process.env.RESEND_API_KEY) {
@@ -94,24 +146,11 @@ async function dispatchEmail({ to, subject, text, html }) {
   }
 
   // 4. Standard SMTP / Gmail via Nodemailer
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  const host = process.env.SMTP_HOST || 'smtp.gmail.com';
-  const port = Number(process.env.SMTP_PORT) || 587;
-  const secure = process.env.SMTP_SECURE === 'true' || port === 465;
+  const { user, pass, transportConfig } = getTransporterOptions();
 
   if (user && pass) {
     try {
-      const transporter = nodemailer.createTransport({
-        host,
-        port,
-        secure,
-        auth: { user, pass },
-        connectionTimeout: 8000,
-        greetingTimeout: 8000,
-        socketTimeout: 10000,
-        tls: { rejectUnauthorized: false },
-      });
+      const transporter = nodemailer.createTransport(transportConfig);
 
       const info = await transporter.sendMail({
         from: fromEmail,
@@ -137,26 +176,50 @@ async function dispatchEmail({ to, subject, text, html }) {
  * Verify SMTP connection configuration
  */
 export async function verifySmtpConnection() {
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
+  const { user, pass, transportConfig } = getTransporterOptions();
 
   if (!user || !pass) {
     console.warn('[Mail] SMTP credentials not configured.');
-    return false;
+    return { success: false, error: 'SMTP credentials not configured (SMTP_USER / SMTP_PASS missing).' };
   }
   try {
-    const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST || 'smtp.gmail.com',
-      port: Number(process.env.SMTP_PORT) || 587,
-      auth: { user, pass },
-    });
+    const transporter = nodemailer.createTransport(transportConfig);
     await transporter.verify();
     console.log('✅ [Mail] SMTP transporter verified successfully.');
-    return true;
+    return { success: true, message: 'SMTP transporter verified successfully.' };
   } catch (error) {
     console.error('❌ [Mail] SMTP verification check:', error.message);
-    return false;
+    return { success: false, error: error.message };
   }
+}
+
+/**
+ * Send Diagnostic Test Email
+ */
+export async function sendTestEmail({ to }) {
+  if (!to) {
+    throw new Error('Recipient email is required.');
+  }
+  const subject = 'KlanServiceHub Mail Configuration Test';
+  const text = 'This is a test email confirming that your KlanServiceHub SMTP / Email configuration is working properly.';
+  const html = `
+    <!DOCTYPE html>
+    <html>
+      <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: #0b0f19; padding: 24px; color: #f1f5f9;">
+        <div style="max-width: 500px; margin: 0 auto; background: #1e293b; border-radius: 12px; padding: 28px; border: 1px solid #334155;">
+          <h2 style="color: #38bdf8; margin-top: 0;">✅ Mail Configuration Working</h2>
+          <p style="color: #cbd5e1; font-size: 14px; line-height: 1.6;">
+            This email confirms that your KlanServiceHub SMTP mail delivery configuration is successfully set up and active.
+          </p>
+          <div style="background: #0f172a; border-radius: 8px; padding: 14px; margin-top: 20px; font-size: 12px; color: #94a3b8;">
+            <div><strong>Timestamp:</strong> ${new Date().toISOString()}</div>
+            <div><strong>Recipient:</strong> ${to}</div>
+          </div>
+        </div>
+      </body>
+    </html>
+  `;
+  return await dispatchEmail({ to, subject, text, html });
 }
 
 /**

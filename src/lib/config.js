@@ -3,7 +3,20 @@
  */
 
 export function getFrontendUrl(c) {
-  // 1. Cloudflare Worker Environment Bindings (from Hono Context)
+  // 1. Dynamic Origin from incoming request
+  try {
+    const origin = c?.req?.header('origin') || c?.req?.header('referer');
+    if (origin) {
+      const parsed = new URL(origin);
+      if (parsed.origin && parsed.origin !== 'null' && !parsed.origin.includes('undefined')) {
+        return parsed.origin;
+      }
+    }
+  } catch (e) {
+    // Ignore invalid header url
+  }
+
+  // 2. Cloudflare Worker Environment Bindings (from Hono Context)
   if (c?.env?.FRONTEND_URL) {
     return c.env.FRONTEND_URL.replace(/\/+$/, '');
   }
@@ -11,7 +24,7 @@ export function getFrontendUrl(c) {
     return c.env.NEXT_PUBLIC_APP_BASE_URL.replace(/\/+$/, '');
   }
 
-  // 2. Node / Process Environment Variables (Local Development)
+  // 3. Node / Process Environment Variables (Local Development)
   if (typeof process !== 'undefined') {
     if (process.env?.FRONTEND_URL) {
       return process.env.FRONTEND_URL.replace(/\/+$/, '');
@@ -21,7 +34,7 @@ export function getFrontendUrl(c) {
     }
   }
 
-  // 3. Fallback default
+  // 4. Fallback default
   return 'https://klanservicehub-frontend.pages.dev';
 }
 

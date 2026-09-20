@@ -12,12 +12,12 @@ const app = new Hono()
     const { token } = ctx.req.param();
 
     const invite = db.prepare(`
-      SELECT i.*, w.name as organization_name, w.image_url as organization_image,
-             u.name as inviter_name, u.email as inviter_email,
+      SELECT i.*, COALESCE(w.name, 'Workspace') as organization_name, w.image_url as organization_image,
+             COALESCE(u.name, 'Team Administrator') as inviter_name, u.email as inviter_email,
              p.name as project_name
       FROM invitations i
-      JOIN workspaces w ON i.organization_id = w.id
-      JOIN users u ON i.invited_by = u.id
+      LEFT JOIN workspaces w ON i.organization_id = w.id
+      LEFT JOIN users u ON i.invited_by = u.id
       LEFT JOIN projects p ON i.project_id = p.id
       WHERE i.token_hash = ?
     `).get(token);
@@ -61,6 +61,15 @@ const app = new Hono()
       return ctx.json({ error: 'Invitation not found.' }, 404);
     }
 
+    if (invite.status === 'ACCEPTED') {
+      return ctx.json({
+        success: true,
+        workspaceId: invite.organization_id,
+        projectId: invite.project_id,
+        message: 'Invitation already accepted.',
+      });
+    }
+
     if (invite.status !== 'PENDING') {
       return ctx.json({ error: `This invitation is already ${invite.status.toLowerCase()}.` }, 400);
     }
@@ -82,10 +91,13 @@ const app = new Hono()
       `).run(memberId, invite.organization_id, user.$id, memberRole, invite.organization_role || 'MEMBER');
 
       // Assign system role in roles table
-      const systemRole = db.prepare('SELECT id FROM roles WHERE workspace_id = ? AND name = ?').get(
+      let systemRole = db.prepare('SELECT id FROM roles WHERE workspace_id = ? AND name = ?').get(
         invite.organization_id,
         invite.organization_role === 'COMPANY_ADMIN' ? 'Company Admin' : (invite.organization_role === 'USER_ACCESS_ADMIN' ? 'User Access Admin' : 'Developer')
       );
+      if (!systemRole) {
+        systemRole = db.prepare('SELECT id FROM roles WHERE workspace_id = ? LIMIT 1').get(invite.organization_id);
+      }
       if (systemRole) {
         db.prepare(`
           INSERT OR IGNORE INTO user_roles (id, workspace_id, user_id, role_id)
@@ -121,14 +133,16 @@ const app = new Hono()
       details: { email: invite.email, role: invite.organization_role },
     });
 
-    createNotification({
-      workspaceId: invite.organization_id,
-      userId: invite.invited_by,
-      title: 'Invitation Accepted',
-      message: `${user.name} (${invite.email}) joined your organization.`,
-      link: `/workspaces/${invite.organization_id}/users-admin`,
-      type: 'SYSTEM',
-    });
+    if (invite.invited_by) {
+      createNotification({
+        workspaceId: invite.organization_id,
+        userId: invite.invited_by,
+        title: 'Invitation Accepted',
+        message: `${user.name || user.email} (${invite.email}) joined your organization.`,
+        link: `/workspaces/${invite.organization_id}/users-admin`,
+        type: 'SYSTEM',
+      });
+    }
 
     broadcastWorkspaceEvent(invite.organization_id, 'InvitationAcceptedEvent', {
       userId: user.$id,
