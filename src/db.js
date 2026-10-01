@@ -1,44 +1,500 @@
-import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
-import fs from 'fs';
+import { fileURLToPath } from 'url';
 import { randomUUID } from 'node:crypto';
 
-// Universal database path resolution (works on Node.js and Cloudflare Workers)
-let databaseInstance = null;
-
+// Dynamically resolve DatabaseSync in Node.js runtime without breaking Cloudflare Workers bundler
+let DatabaseSync = null;
 try {
-  let dbPath = 'jira.db';
-  if (typeof process !== 'undefined' && process && typeof process.cwd === 'function') {
+  if (typeof process !== 'undefined' && typeof process.getBuiltinModule === 'function') {
+    const sqlite = process.getBuiltinModule('node:sqlite');
+    if (sqlite?.DatabaseSync) {
+      DatabaseSync = sqlite.DatabaseSync;
+    }
+  }
+} catch (e) {
+  // Ignored in environments without process.getBuiltinModule
+}
+
+if (!DatabaseSync) {
+  try {
+    const sqliteModuleId = 'node:sqlite';
+    const sqlite = await import(/* @vite-ignore */ sqliteModuleId);
+    DatabaseSync = sqlite?.DatabaseSync || sqlite?.default?.DatabaseSync || null;
+  } catch (e) {
+    // Expected in Cloudflare Workers / workerd environment
+  }
+}
+
+let dbPath = ':memory:';
+try {
+  const metaUrl = typeof import.meta !== 'undefined' ? import.meta?.url : undefined;
+  if (metaUrl && typeof metaUrl === 'string' && metaUrl.startsWith('file:')) {
+    const __dirname = path.dirname(fileURLToPath(metaUrl));
+    dbPath = path.resolve(__dirname, '../jira.db');
+  } else if (typeof process !== 'undefined' && process.cwd && typeof path?.resolve === 'function') {
     dbPath = path.resolve(process.cwd(), 'jira.db');
   }
+} catch (e) {
+  dbPath = ':memory:';
+}
+
+export class MemoryDb {
+  constructor() {
+    this.tables = new Map();
+    this.activeD1 = null;
+    this.activeCtx = null;
+    this.isD1Synced = false;
+  }
+
+  getTable(name) {
+    const clean = name.toLowerCase().replace(/[`"']/g, '').trim();
+    if (!this.tables.has(clean)) {
+      this.tables.set(clean, []);
+    }
+    return this.tables.get(clean);
+  }
+
+  exec(sql) {
+    if (!sql || typeof sql !== 'string') return;
+    const statements = sql.split(';').map((s) => s.trim()).filter(Boolean);
+    for (const stmt of statements) {
+      if (/^PRAGMA/i.test(stmt)) continue;
+      if (/^CREATE TABLE/i.test(stmt)) {
+        const match = stmt.match(/CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)/i);
+        if (match) this.getTable(match[1]);
+        continue;
+      }
+      if (/^ALTER TABLE/i.test(stmt)) {
+        continue;
+      }
+      try {
+        this.prepare(stmt).run();
+      } catch (e) {
+        // ignore init errors
+      }
+    }
+  }
+
+  transaction(fn) {
+    return (...args) => fn(...args);
+  }
+
+  prepare(rawSql) {
+    const memDb = this;
+    const sql = rawSql.trim();
+
+    return {
+      run(...params) {
+        return memDb._executeWrite(sql, params);
+      },
+      get(...params) {
+        const rows = memDb._executeSelect(sql, params);
+        return rows.length > 0 ? rows[0] : undefined;
+      },
+      all(...params) {
+        return memDb._executeSelect(sql, params);
+      },
+    };
+  }
+
+  _executeWrite(sql, params) {
+    // Cloudflare D1 live asynchronous mirroring
+    if (this.activeD1 && typeof this.activeD1.prepare === 'function') {
+      try {
+        const d1Promise = this.activeD1.prepare(sql).bind(...params).run().catch((err) => {
+          console.warn('[D1_WRITE_SYNC_ERROR]:', err?.message || err, 'SQL:', sql);
+        });
+        if (this.activeCtx && typeof this.activeCtx.waitUntil === 'function') {
+          this.activeCtx.waitUntil(d1Promise);
+        }
+      } catch (e) {
+        console.warn('[D1_PREPARE_ERROR]:', e?.message || e);
+      }
+    }
+
+    const insertMatch = sql.match(/INSERT\s+(?:OR\s+IGNORE\s+|OR\s+REPLACE\s+)?INTO\s+([^\s(]+)\s*\(([^)]+)\)\s*VALUES\s*\(([^)]+)\)/i);
+    if (insertMatch) {
+      const tableName = insertMatch[1].toLowerCase().replace(/[`"']/g, '').trim();
+      const cols = insertMatch[2].split(',').map((c) => c.trim().replace(/[`"']/g, ''));
+      const table = this.getTable(tableName);
+      
+      const newRow = {
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString(),
+      };
+      
+      let paramIdx = 0;
+      for (const col of cols) {
+        if (paramIdx < params.length) {
+          newRow[col] = params[paramIdx++];
+        } else {
+          newRow[col] = null;
+        }
+      }
+
+      if (!newRow.id && cols.includes('id')) {
+        newRow.id = randomUUID();
+      }
+
+      if (newRow.id) {
+        const existingIdx = table.findIndex((r) => r.id === newRow.id);
+        if (existingIdx !== -1) {
+          table[existingIdx] = { ...table[existingIdx], ...newRow };
+          return { changes: 1, lastInsertRowid: existingIdx + 1 };
+        }
+      }
+
+      table.push(newRow);
+      return { changes: 1, lastInsertRowid: table.length };
+    }
+
+    const updateMatch = sql.match(/UPDATE\s+([^\s]+)\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?$/i);
+    if (updateMatch) {
+      const tableName = updateMatch[1].toLowerCase().replace(/[`"']/g, '').trim();
+      const setClause = updateMatch[2];
+      const whereClause = updateMatch[3];
+      const table = this.getTable(tableName);
+
+      const setAssignments = setClause.split(',').map((s) => s.trim());
+      const setCols = [];
+      let setValuesCount = 0;
+      for (const assign of setAssignments) {
+        const parts = assign.split('=');
+        if (parts.length === 2) {
+          const col = parts[0].trim().replace(/[`"']/g, '');
+          const valExpr = parts[1].trim();
+          setCols.push({ col, valExpr });
+          if (valExpr === '?') setValuesCount++;
+        }
+      }
+
+      const setParams = params.slice(0, setValuesCount);
+      const whereParams = params.slice(setValuesCount);
+
+      let changed = 0;
+      for (let i = 0; i < table.length; i++) {
+        const row = table[i];
+        if (!whereClause || this._rowMatchesWhere(row, whereClause, whereParams)) {
+          let pIdx = 0;
+          for (const s of setCols) {
+            if (s.valExpr === '?') {
+              row[s.col] = setParams[pIdx++];
+            } else if (s.valExpr === 'CURRENT_TIMESTAMP') {
+              row[s.col] = new Date().toISOString();
+            } else if (/^[0-9]+$/.test(s.valExpr)) {
+              row[s.col] = Number(s.valExpr);
+            } else {
+              row[s.col] = s.valExpr.replace(/^['"]|['"]$/g, '');
+            }
+          }
+          row.updated_at = new Date().toISOString();
+          changed++;
+        }
+      }
+      return { changes: changed, lastInsertRowid: 0 };
+    }
+
+    const deleteMatch = sql.match(/DELETE\s+FROM\s+([^\s]+)(?:\s+WHERE\s+(.+))?$/i);
+    if (deleteMatch) {
+      const tableName = deleteMatch[1].toLowerCase().replace(/[`"']/g, '').trim();
+      const whereClause = deleteMatch[2];
+      const table = this.getTable(tableName);
+
+      if (!whereClause) {
+        const count = table.length;
+        this.tables.set(tableName, []);
+        return { changes: count, lastInsertRowid: 0 };
+      }
+
+      const initialLength = table.length;
+      const remaining = table.filter((row) => !this._rowMatchesWhere(row, whereClause, params));
+      this.tables.set(tableName, remaining);
+      return { changes: initialLength - remaining.length, lastInsertRowid: 0 };
+    }
+
+    return { changes: 0, lastInsertRowid: 0 };
+  }
+
+  _executeSelect(sql, params) {
+    const isCount = /SELECT\s+COUNT\s*\(/i.test(sql);
+
+    const fromMatch = sql.match(/FROM\s+([^\s,]+)(?:\s+(?:AS\s+)?([^\s,]+))?(?:\s+JOIN\s+([^\s,]+)(?:\s+(?:AS\s+)?([^\s,]+))?\s+ON\s+([^\s]+)\s*=\s*([^\s]+))?(?:\s+WHERE\s+(.+?))?(?:\s+GROUP\s+BY\s+.+?)?(?:\s+ORDER\s+BY\s+(.+?))?(?:\s+LIMIT\s+([0-9]+|\?))?$/i);
+    
+    if (!fromMatch) {
+      return [];
+    }
+
+    const table1Name = fromMatch[1].toLowerCase().replace(/[`"']/g, '').trim();
+    const table1Alias = fromMatch[2] ? fromMatch[2].toLowerCase().replace(/[`"']/g, '').trim() : table1Name;
+    const table2Name = fromMatch[3] ? fromMatch[3].toLowerCase().replace(/[`"']/g, '').trim() : null;
+    const table2Alias = fromMatch[4] ? fromMatch[4].toLowerCase().replace(/[`"']/g, '').trim() : table2Name;
+    const joinCol1 = fromMatch[5];
+    const joinCol2 = fromMatch[6];
+    const whereClause = fromMatch[7];
+    const orderByClause = fromMatch[8];
+    const limitClause = fromMatch[9];
+
+    let rows = [];
+    const t1 = this.getTable(table1Name);
+
+    if (table2Name) {
+      const t2 = this.getTable(table2Name);
+      for (const r1 of t1) {
+        for (const r2 of t2) {
+          const combined = { ...r1, ...r2 };
+          let joinMatch = true;
+          if (joinCol1 && joinCol2) {
+            const getVal = (colExpr) => {
+              const parts = colExpr.split('.');
+              const col = parts.length > 1 ? parts[1].replace(/[`"']/g, '') : parts[0].replace(/[`"']/g, '');
+              const alias = parts.length > 1 ? parts[0].toLowerCase() : null;
+              if (alias === table1Alias) return r1[col];
+              if (alias === table2Alias) return r2[col];
+              return r1[col] ?? r2[col];
+            };
+            joinMatch = getVal(joinCol1) == getVal(joinCol2);
+          }
+          if (joinMatch) {
+            rows.push(combined);
+          }
+        }
+      }
+    } else {
+      rows = t1.map((r) => ({ ...r }));
+    }
+
+    if (whereClause) {
+      rows = rows.filter((row) => this._rowMatchesWhere(row, whereClause, params));
+    }
+
+    if (isCount) {
+      return [{ count: rows.length, c: rows.length, 'count(*)': rows.length }];
+    }
+
+    if (orderByClause) {
+      const isDesc = /DESC/i.test(orderByClause);
+      const orderCol = orderByClause.replace(/ASC|DESC/gi, '').split(',')[0].trim().replace(/[`"']/g, '');
+      const cleanCol = orderCol.includes('.') ? orderCol.split('.')[1] : orderCol;
+      rows.sort((a, b) => {
+        const valA = a[cleanCol] ?? '';
+        const valB = b[cleanCol] ?? '';
+        if (valA < valB) return isDesc ? 1 : -1;
+        if (valA > valB) return isDesc ? -1 : 1;
+        return 0;
+      });
+    }
+
+    if (limitClause) {
+      const limitNum = limitClause === '?' ? Number(params[params.length - 1]) : Number(limitClause);
+      if (!isNaN(limitNum) && limitNum > 0) {
+        rows = rows.slice(0, limitNum);
+      }
+    }
+
+    return rows;
+  }
+
+  _rowMatchesWhere(row, whereClause, params) {
+    if (!whereClause) return true;
+    
+    let pIdx = 0;
+    const conditions = whereClause.split(/\s+AND\s+/i);
+
+    for (const cond of conditions) {
+      const trimmed = cond.trim();
+      if (!trimmed) continue;
+
+      if (/datetime\(expires_at\)\s*>\s*datetime\('now'\)/i.test(trimmed)) {
+        if (!row.expires_at || new Date(row.expires_at).getTime() <= Date.now()) {
+          return false;
+        }
+        continue;
+      }
+
+      // Check IS NOT NULL
+      const isNotNullMatch = trimmed.match(/([^\s]+)\s+IS\s+NOT\s+NULL/i);
+      if (isNotNullMatch) {
+        let col = isNotNullMatch[1].trim().replace(/[`"']/g, '');
+        if (col.includes('.')) col = col.split('.')[1];
+        if (row[col] === null || row[col] === undefined) return false;
+        continue;
+      }
+
+      // Check IS NULL
+      const isNullMatch = trimmed.match(/([^\s]+)\s+IS\s+NULL/i);
+      if (isNullMatch) {
+        let col = isNullMatch[1].trim().replace(/[`"']/g, '');
+        if (col.includes('.')) col = col.split('.')[1];
+        if (row[col] !== null && row[col] !== undefined) return false;
+        continue;
+      }
+
+      // Check IN (...)
+      const inMatch = trimmed.match(/([^\s]+)\s+IN\s*\(([^)]+)\)/i);
+      if (inMatch) {
+        let col = inMatch[1].trim().replace(/[`"']/g, '');
+        if (col.includes('.')) col = col.split('.')[1];
+        const inside = inMatch[2].split(',').map(s => s.trim());
+        const allowed = inside.map(item => {
+          if (item === '?') return params[pIdx++];
+          return item.replace(/^['"]|['"]$/g, '');
+        });
+        if (!allowed.map(String).includes(String(row[col] ?? ''))) return false;
+        continue;
+      }
+
+      const eqMatch = trimmed.match(/([^\s=!<]+)\s*(=|!=|<>|LIKE|<|<=|>|>=)\s*(.+)/i);
+      if (eqMatch) {
+        let col = eqMatch[1].trim().replace(/[`"']/g, '');
+        if (col.includes('.')) col = col.split('.')[1];
+        const op = eqMatch[2].toUpperCase();
+        let target = eqMatch[3].trim();
+
+        let expectedValue;
+        if (target === '?') {
+          expectedValue = params[pIdx++];
+        } else if (/^[0-9]+$/.test(target)) {
+          expectedValue = Number(target);
+        } else if (/^NULL$/i.test(target)) {
+          expectedValue = null;
+        } else {
+          expectedValue = target.replace(/^['"]|['"]$/g, '');
+        }
+
+        const actualValue = row[col];
+
+        if (op === '=') {
+          if (expectedValue === null) {
+            if (actualValue !== null && actualValue !== undefined) return false;
+          } else {
+            if (String(actualValue ?? '').toLowerCase() !== String(expectedValue ?? '').toLowerCase()) return false;
+          }
+        } else if (op === '!=' || op === '<>') {
+          if (String(actualValue ?? '').toLowerCase() === String(expectedValue ?? '').toLowerCase()) return false;
+        } else if (op === 'LIKE') {
+          const pattern = String(expectedValue ?? '').replace(/%/g, '.*');
+          const regex = new RegExp(`^${pattern}$`, 'i');
+          if (!regex.test(String(actualValue ?? ''))) return false;
+        } else if (op === '>') {
+          if (Number(actualValue) <= Number(expectedValue)) return false;
+        } else if (op === '>=') {
+          if (Number(actualValue) < Number(expectedValue)) return false;
+        } else if (op === '<') {
+          if (Number(actualValue) >= Number(expectedValue)) return false;
+        } else if (op === '<=') {
+          if (Number(actualValue) > Number(expectedValue)) return false;
+        }
+      }
+    }
+
+    return true;
+  }
+}
+
+let dbInstance;
+try {
   if (typeof DatabaseSync === 'function') {
-    databaseInstance = new DatabaseSync(dbPath);
+    dbInstance = new DatabaseSync(dbPath);
   }
 } catch (e) {
   try {
     if (typeof DatabaseSync === 'function') {
-      databaseInstance = new DatabaseSync(':memory:');
+      dbInstance = new DatabaseSync(':memory:');
     }
   } catch (err) {
-    // Running in Cloudflare edge worker isolate
+    // DatabaseSync not available in this runtime/isolate
   }
 }
 
-// Fallback proxy to ensure db is NEVER undefined during edge bundle evaluation
-if (!databaseInstance || typeof databaseInstance.exec !== 'function') {
-  databaseInstance = {
-    exec: () => {},
-    prepare: (sql) => ({
-      all: () => [],
-      get: () => null,
-      run: () => ({ changes: 0, lastInsertRowid: 0 }),
-    }),
-  };
+if (!dbInstance || typeof dbInstance.exec !== 'function') {
+  dbInstance = new MemoryDb();
 }
 
-export const db = databaseInstance;
+export const db = dbInstance;
 
-// Enable WAL mode, busy timeout, and foreign keys safely
+let d1SyncPromise = null;
+
+// Helper to bind and sync Cloudflare D1 with the application
+export async function initOrSyncD1(d1, executionCtx) {
+  if (!d1) return;
+
+  if (db instanceof MemoryDb) {
+    db.activeD1 = d1;
+    db.activeCtx = executionCtx;
+  }
+
+  if (d1SyncPromise) {
+    return d1SyncPromise;
+  }
+
+  d1SyncPromise = (async () => {
+    try {
+      // 1. Check if core tables exist in Cloudflare D1
+      let tableCheck = null;
+      try {
+        tableCheck = await d1.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name = 'users'").first();
+      } catch (e) {
+        tableCheck = null;
+      }
+
+      if (!tableCheck) {
+        console.log('[D1_INIT] Initializing schema on remote D1 database...');
+        const statements = SCHEMA_SQL.split(';')
+          .map((s) => s.trim())
+          .filter((s) => s.length > 0 && !s.startsWith('--') && !s.toUpperCase().startsWith('PRAGMA'));
+
+        for (const stmt of statements) {
+          try {
+            await d1.prepare(stmt).run();
+          } catch (e) {
+            // Ignore minor duplicate/create errors
+          }
+        }
+      }
+
+      // 2. Hydrate in-memory tables from D1
+      if (db instanceof MemoryDb) {
+        const ALL_TABLE_NAMES = [
+          'users', 'sessions', 'email_verifications', 'workspaces', 'members',
+          'invitations', 'roles', 'permissions', 'role_permissions', 'user_roles',
+          'teams', 'team_members', 'team_projects', 'projects', 'issue_types',
+          'workflows', 'workflow_statuses', 'workflow_transitions', 'sprints',
+          'boards', 'dashboards', 'dashboard_gadgets', 'tasks', 'task_assignees',
+          'task_comments', 'task_watchers', 'task_history', 'task_attachments',
+          'task_links', 'activities', 'work_logs', 'project_components',
+          'saved_filters', 'custom_fields', 'task_custom_field_values',
+          'issue_type_schemes', 'priority_schemes', 'sla_definitions', 'sla_records',
+          'webhooks', 'webhook_deliveries', 'user_favorites', 'user_recent_items',
+          'api_tokens', 'audit_logs', 'notifications', 'automations', 'automation_logs',
+          'releases', 'project_groups', 'group_members', 'user_security',
+          'security_events', 'trusted_devices', 'two_factor_auth', 'sso_configurations',
+          'ip_allowlists', 'integrations', 'integration_sync_logs', 'billing_subscriptions',
+          'billing_invoices', 'data_exports', 'data_backups', 'data_imports',
+          'retention_policies', 'retention_execution_logs'
+        ];
+
+        for (const tbl of ALL_TABLE_NAMES) {
+          try {
+            const res = await d1.prepare(`SELECT * FROM ${tbl}`).all();
+            if (res && Array.isArray(res.results)) {
+              db.tables.set(tbl, res.results);
+            }
+          } catch (e) {
+            // Table might not exist yet, ignore
+          }
+        }
+        db.isD1Synced = true;
+        console.log('[D1_INIT] Successfully hydrated tables from D1 into isolate memory.');
+      }
+    } catch (err) {
+      console.error('[D1_HYDRATION_ERROR]:', err);
+    }
+  })();
+
+  return d1SyncPromise;
+}
+
+// Enable WAL mode, busy timeout, and foreign keys
 try {
   if (db && typeof db.exec === 'function') {
     db.exec('PRAGMA journal_mode = WAL;');
@@ -47,7 +503,7 @@ try {
     db.exec('PRAGMA foreign_keys = ON;');
   }
 } catch (e) {
-  // Edge runtime memory DB compatibility
+  // Ignored in environments that don't support PRAGMA or memory db
 }
 
 // Helper to safely add column if it doesn't exist
@@ -61,11 +517,8 @@ function safeAddColumn(table, columnDef) {
   }
 }
 
-// Initialize tables from schema
-const initSchema = () => {
-  try {
-    if (db && typeof db.exec === 'function') {
-      db.exec(`
+// Master Schema Definitions
+export const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -924,63 +1377,7 @@ const initSchema = () => {
     CREATE INDEX IF NOT EXISTS idx_task_assignees_member_id ON task_assignees(member_id);
     CREATE INDEX IF NOT EXISTS idx_audit_logs_workspace ON audit_logs(workspace_id);
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, workspace_id);
-  `);
 
-  // Run safe column additions for existing tables
-  safeAddColumn('users', "avatar_url TEXT");
-  safeAddColumn('users', "phone TEXT");
-  safeAddColumn('users', "job_title TEXT");
-  safeAddColumn('users', "department TEXT");
-  safeAddColumn('users', "status TEXT NOT NULL DEFAULT 'ACTIVE'");
-
-  safeAddColumn('sessions', "ip_address TEXT DEFAULT '127.0.0.1'");
-  safeAddColumn('sessions', "user_agent TEXT DEFAULT 'Web Browser'");
-  safeAddColumn('sessions', "device_info TEXT DEFAULT 'Desktop Device'");
-
-  safeAddColumn('workspaces', "description TEXT DEFAULT ''");
-  safeAddColumn('workspaces', "website TEXT DEFAULT ''");
-  safeAddColumn('workspaces', "email TEXT DEFAULT ''");
-  safeAddColumn('workspaces', "phone TEXT DEFAULT ''");
-  safeAddColumn('workspaces', "address TEXT DEFAULT ''");
-  safeAddColumn('workspaces', "timezone TEXT DEFAULT 'UTC'");
-  safeAddColumn('workspaces', "language TEXT DEFAULT 'en-US'");
-  safeAddColumn('workspaces', "date_format TEXT DEFAULT 'YYYY-MM-DD'");
-  safeAddColumn('workspaces', "currency TEXT DEFAULT 'USD'");
-  safeAddColumn('workspaces', "status TEXT DEFAULT 'ACTIVE'");
-
-  safeAddColumn('members', "status TEXT NOT NULL DEFAULT 'ACTIVE'");
-
-  safeAddColumn('projects', "key TEXT DEFAULT 'PROJ'");
-  safeAddColumn('projects', "description TEXT DEFAULT ''");
-  safeAddColumn('projects', "category TEXT DEFAULT 'Software'");
-  safeAddColumn('projects', "lead_id TEXT");
-  safeAddColumn('projects', "is_archived INTEGER DEFAULT 0");
-
-  safeAddColumn('tasks', "reporter_id TEXT");
-  safeAddColumn('tasks', "sprint_id TEXT");
-  safeAddColumn('tasks', "issue_type TEXT NOT NULL DEFAULT 'Task'");
-  safeAddColumn('tasks', "key TEXT");
-  safeAddColumn('tasks', "priority TEXT NOT NULL DEFAULT 'MEDIUM'");
-  safeAddColumn('tasks', "labels TEXT DEFAULT '[]'");
-  safeAddColumn('tasks', "story_points REAL DEFAULT 1");
-  safeAddColumn('tasks', "epic_id TEXT");
-  safeAddColumn('tasks', "parent_task_id TEXT");
-  safeAddColumn('tasks', "release_id TEXT");
-  safeAddColumn('tasks', "original_estimate_hours REAL DEFAULT 0");
-  safeAddColumn('tasks', "logged_hours REAL DEFAULT 0");
-  safeAddColumn('tasks', "components TEXT DEFAULT '[]'");
-  safeAddColumn('password_resets', 'user_id TEXT');
-  safeAddColumn('password_resets', 'attempt_count INTEGER DEFAULT 0');
-  safeAddColumn('service_requests', "description TEXT DEFAULT ''");
-  safeAddColumn('service_requests', "sla_due_at DATETIME");
-  safeAddColumn('service_requests', "sla_first_response_due_at DATETIME");
-  safeAddColumn('service_requests', "sla_breached INTEGER DEFAULT 0");
-  safeAddColumn('service_requests', "resolved_at DATETIME");
-  safeAddColumn('service_requests', "satisfaction_rating INTEGER");
-  safeAddColumn('service_requests', "assigned_agent_id TEXT");
-  safeAddColumn('service_requests', "customer_org_id TEXT");
-
-  db.exec(`
     CREATE TABLE IF NOT EXISTS email_verifications (
       id TEXT PRIMARY KEY,
       email TEXT NOT NULL,
@@ -1059,8 +1456,67 @@ const initSchema = () => {
       status TEXT NOT NULL DEFAULT 'UNRELEASED', -- UNRELEASED, RELEASED, ARCHIVED
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
-  `);
-    }
+`;
+
+// Initialize tables from schema
+const initSchema = () => {
+  try {
+    if (!db || typeof db.exec !== 'function') return;
+    db.exec(SCHEMA_SQL);
+
+  // Run safe column additions for existing tables
+  safeAddColumn('users', "avatar_url TEXT");
+  safeAddColumn('users', "phone TEXT");
+  safeAddColumn('users', "job_title TEXT");
+  safeAddColumn('users', "department TEXT");
+  safeAddColumn('users', "status TEXT NOT NULL DEFAULT 'ACTIVE'");
+
+  safeAddColumn('sessions', "ip_address TEXT DEFAULT '127.0.0.1'");
+  safeAddColumn('sessions', "user_agent TEXT DEFAULT 'Web Browser'");
+  safeAddColumn('sessions', "device_info TEXT DEFAULT 'Desktop Device'");
+
+  safeAddColumn('workspaces', "description TEXT DEFAULT ''");
+  safeAddColumn('workspaces', "website TEXT DEFAULT ''");
+  safeAddColumn('workspaces', "email TEXT DEFAULT ''");
+  safeAddColumn('workspaces', "phone TEXT DEFAULT ''");
+  safeAddColumn('workspaces', "address TEXT DEFAULT ''");
+  safeAddColumn('workspaces', "timezone TEXT DEFAULT 'UTC'");
+  safeAddColumn('workspaces', "language TEXT DEFAULT 'en-US'");
+  safeAddColumn('workspaces', "date_format TEXT DEFAULT 'YYYY-MM-DD'");
+  safeAddColumn('workspaces', "currency TEXT DEFAULT 'USD'");
+  safeAddColumn('workspaces', "status TEXT DEFAULT 'ACTIVE'");
+
+  safeAddColumn('members', "status TEXT NOT NULL DEFAULT 'ACTIVE'");
+
+  safeAddColumn('projects', "key TEXT DEFAULT 'PROJ'");
+  safeAddColumn('projects', "description TEXT DEFAULT ''");
+  safeAddColumn('projects', "category TEXT DEFAULT 'Software'");
+  safeAddColumn('projects', "lead_id TEXT");
+  safeAddColumn('projects', "is_archived INTEGER DEFAULT 0");
+
+  safeAddColumn('tasks', "reporter_id TEXT");
+  safeAddColumn('tasks', "sprint_id TEXT");
+  safeAddColumn('tasks', "issue_type TEXT NOT NULL DEFAULT 'Task'");
+  safeAddColumn('tasks', "key TEXT");
+  safeAddColumn('tasks', "priority TEXT NOT NULL DEFAULT 'MEDIUM'");
+  safeAddColumn('tasks', "labels TEXT DEFAULT '[]'");
+  safeAddColumn('tasks', "story_points REAL DEFAULT 1");
+  safeAddColumn('tasks', "epic_id TEXT");
+  safeAddColumn('tasks', "parent_task_id TEXT");
+  safeAddColumn('tasks', "release_id TEXT");
+  safeAddColumn('tasks', "original_estimate_hours REAL DEFAULT 0");
+  safeAddColumn('tasks', "logged_hours REAL DEFAULT 0");
+  safeAddColumn('tasks', "components TEXT DEFAULT '[]'");
+  safeAddColumn('password_resets', 'user_id TEXT');
+  safeAddColumn('password_resets', 'attempt_count INTEGER DEFAULT 0');
+  safeAddColumn('service_requests', "description TEXT DEFAULT ''");
+  safeAddColumn('service_requests', "sla_due_at DATETIME");
+  safeAddColumn('service_requests', "sla_first_response_due_at DATETIME");
+  safeAddColumn('service_requests', "sla_breached INTEGER DEFAULT 0");
+  safeAddColumn('service_requests', "resolved_at DATETIME");
+  safeAddColumn('service_requests', "satisfaction_rating INTEGER");
+  safeAddColumn('service_requests', "assigned_agent_id TEXT");
+  safeAddColumn('service_requests', "customer_org_id TEXT");
 
   // Run safe column additions for existing tables
   safeAddColumn('users', "avatar_url TEXT");
@@ -1133,9 +1589,9 @@ const initSchema = () => {
   safeAddColumn('groups', "group_type TEXT DEFAULT 'CUSTOM'");
   safeAddColumn('groups', "role_mapping TEXT DEFAULT 'MEMBER'");
 
-  seedDefaultPermissions();
-  } catch (e) {
-    // Cloudflare edge D1 migration safe
+    seedDefaultPermissions();
+  } catch (err) {
+    // Ignore schema init errors in serverless isolate
   }
 };
 
@@ -1273,18 +1729,17 @@ export const SYSTEM_PERMISSIONS = [
 
 function seedDefaultPermissions() {
   try {
-    if (db && typeof db.prepare === 'function') {
-      const insertPerm = db.prepare(`
-        INSERT OR REPLACE INTO permissions (id, code, name, category, description)
-        VALUES (?, ?, ?, ?, ?)
-      `);
+    if (!db || typeof db.prepare !== 'function') return;
+    const insertPerm = db.prepare(`
+      INSERT OR REPLACE INTO permissions (id, code, name, category, description)
+      VALUES (?, ?, ?, ?, ?)
+    `);
 
-      for (const p of SYSTEM_PERMISSIONS) {
-        insertPerm.run(p.code, p.code, p.name, p.category, p.description);
-      }
+    for (const p of SYSTEM_PERMISSIONS) {
+      insertPerm.run(p.code, p.code, p.name, p.category, p.description);
     }
-  } catch (e) {
-    // Cloudflare edge D1 migration safe
+  } catch (err) {
+    // Ignore in stub/serverless environment
   }
 }
 
@@ -1595,7 +2050,7 @@ export function triggerAutomations({ workspaceId, triggerEvent, context = {} }) 
 try {
   initSchema();
 } catch (e) {
-  // Edge runtime schema is managed via Cloudflare D1 SQL migrations
+  // Ignore
 }
 
 // Auto-seed default dashboards if not present
@@ -1641,22 +2096,26 @@ try {
     },
   ];
 
-  const wsList = db.prepare('SELECT id, user_id FROM workspaces').all() || [];
-  for (const ws of wsList) {
-    const existing = db.prepare('SELECT COUNT(*) as c FROM dashboards WHERE workspace_id = ?').get(ws.id)?.c ?? 0;
-    if (existing === 0) {
-      for (const tpl of DEFAULT_DASH_TPLS) {
-        const dashId = randomUUID();
-        db.prepare(`
-          INSERT INTO dashboards (id, workspace_id, name, description, layout, is_default, created_by)
-          VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(dashId, ws.id, tpl.name, tpl.description, tpl.layout, tpl.is_default, ws.user_id);
-
-        for (const g of tpl.gadgets) {
+  if (db && typeof db.prepare === 'function') {
+    const wsList = db.prepare('SELECT id, user_id FROM workspaces').all() || [];
+    for (const ws of wsList) {
+      if (!ws || !ws.id) continue;
+      const row = db.prepare('SELECT COUNT(*) as c FROM dashboards WHERE workspace_id = ?').get(ws.id);
+      const existing = row?.c ?? 0;
+      if (existing === 0) {
+        for (const tpl of DEFAULT_DASH_TPLS) {
+          const dashId = randomUUID();
           db.prepare(`
-            INSERT INTO dashboard_gadgets (id, dashboard_id, workspace_id, gadget_type, title, column_index, position, settings)
-            VALUES (?, ?, ?, ?, ?, ?, ?, '{}')
-          `).run(randomUUID(), dashId, ws.id, g.gadget_type, g.title, g.column_index, g.position);
+            INSERT INTO dashboards (id, workspace_id, name, description, layout, is_default, created_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+          `).run(dashId, ws.id, tpl.name, tpl.description, tpl.layout, tpl.is_default, ws.user_id);
+
+          for (const g of tpl.gadgets) {
+            db.prepare(`
+              INSERT INTO dashboard_gadgets (id, dashboard_id, workspace_id, gadget_type, title, column_index, position, settings)
+              VALUES (?, ?, ?, ?, ?, ?, ?, '{}')
+            `).run(randomUUID(), dashId, ws.id, g.gadget_type, g.title, g.column_index, g.position);
+          }
         }
       }
     }
