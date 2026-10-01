@@ -1,4 +1,3 @@
-import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import 'dotenv/config';
@@ -48,29 +47,90 @@ import assets from './features/assets/server/route.js';
 import deployments from './features/deployments/server/route.js';
 import portfolio from './features/portfolio/server/route.js';
 import search from './features/search/server/route.js';
+import { cacheMiddleware, autoInvalidateCacheMiddleware, cacheStore } from './lib/cache.js';
+import { getFrontendUrl } from './lib/config.js';
+import { initOrSyncD1 } from './db.js';
 
 const app = new Hono();
 
-const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:3000';
+// Cloudflare D1 Database synchronization and hydration middleware
+app.use('*', async (c, next) => {
+  if (c.env && c.env.DB) {
+    try {
+      await initOrSyncD1(c.env.DB, c.executionCtx);
+    } catch (err) {
+      console.error('[D1_MIDDLEWARE_SYNC_ERROR]:', err);
+    }
+  }
+  return next();
+});
 
-app.use(
-  '/api/*',
-  cors({
+app.use('*', async (c, next) => {
+  const allowedOrigin = getFrontendUrl(c);
+  return cors({
     origin: (origin) => {
-      if (!origin || origin === allowedOrigin || origin.startsWith('http://localhost:')) {
-        return origin || allowedOrigin;
+      if (!origin) return allowedOrigin;
+      if (
+        origin === allowedOrigin ||
+        origin.startsWith('http://localhost:') ||
+        origin.startsWith('http://127.0.0.1:') ||
+        origin.endsWith('.pages.dev') ||
+        origin.endsWith('.workers.dev') ||
+        origin.includes('klanservicehub') ||
+        origin.includes('jira')
+      ) {
+        return origin;
       }
       return allowedOrigin;
     },
     credentials: true,
-    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowHeaders: ['Content-Type', 'Authorization', 'Cookie'],
-    exposeHeaders: ['Set-Cookie'],
-  }),
-);
+    allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'HEAD'],
+    allowHeaders: [
+      'Content-Type',
+      'Authorization',
+      'authorization',
+      'Cookie',
+      'cookie',
+      'If-None-Match',
+      'x-session-token',
+      'X-Session-Token',
+      'x-auth-token',
+      'X-Auth-Token',
+      'x-workspace-id',
+      'X-Workspace-Id',
+      'x-requested-with',
+      'X-Requested-With',
+      'Accept',
+      'Origin',
+    ],
+    exposeHeaders: ['Set-Cookie', 'ETag', 'X-Cache-Status'],
+    maxAge: 86400,
+  })(c, next);
+});
+
+// Explicit OPTIONS preflight handler
+app.options('*', (c) => {
+  return c.text('', 204);
+});
+
+// Auto-invalidate cache tags on mutating HTTP requests (POST, PUT, PATCH, DELETE)
+app.use('*', autoInvalidateCacheMiddleware());
+
+// In-memory query cache & ETag conditional validation (304 Not Modified) for API routes
+app.use('/api/*', cacheMiddleware({ ttlSeconds: 30 }));
 
 app.get('/health', (ctx) => {
   return ctx.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+// Cache management & telemetry endpoints
+app.get('/api/cache/stats', (ctx) => {
+  return ctx.json({ status: 'ok', ...cacheStore.getStats() });
+});
+
+app.post('/api/cache/purge', (ctx) => {
+  cacheStore.clear();
+  return ctx.json({ success: true, message: 'Cache purged successfully' });
 });
 
 const api = new Hono().basePath('/api');
@@ -156,28 +216,54 @@ apiV1
   .route('/search', search)
   .route('/enterprise', search);
 
+app.route('/api', api);
+app.route('/api/v1', apiV1);
+app.route('/api/auth', auth);
 app.route('/', api);
-app.route('/', apiV1);
+
+import { formatErrorResponse } from './lib/errors.js';
+
+// Global 404 Route Handler
+app.notFound((c) => {
+  return c.json({
+    success: false,
+    error: `Route not found: ${c.req.method} ${c.req.path}`,
+    code: 'NOT_FOUND',
+    statusCode: 404,
+    path: c.req.path,
+    method: c.req.method,
+    timestamp: new Date().toISOString(),
+  }, 404);
+});
+
+// Centralized Enterprise Exception Handler
+app.onError((err, c) => {
+  console.error(`[API_EXCEPTION] ${c.req.method} ${c.req.path} ->`, err.message || err);
+  const errorPayload = formatErrorResponse(err, c.req);
+  return c.json(errorPayload, errorPayload.statusCode);
+});
 
 import { backfillProjectAndTaskKeys } from './lib/issue-key.js';
 
 // Ensure all projects and tasks have unique, project-wise keys
-backfillProjectAndTaskKeys();
+try {
+  backfillProjectAndTaskKeys();
+} catch (e) {
+  // Ignore in serverless isolate
+}
 
-const port = Number(process?.env?.PORT) || 5000;
-const isDirectRun =
-  typeof process !== 'undefined' &&
-  Array.isArray(process?.argv) &&
-  process.argv[1] &&
-  (process.argv[1].endsWith('index.js') ||
-    process.argv[1].endsWith('src/index.js') ||
-    process.argv[1].endsWith('src\\index.js'));
+const port = Number(process.env.PORT) || 5000;
+const isDirectRun = typeof process !== 'undefined' && process.argv && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('src/index.js') || process.argv[1].endsWith('src\\index.js'));
 
-if (isDirectRun && process?.env?.TEST_MODE !== 'true') {
+if (isDirectRun && process.env.TEST_MODE !== 'true') {
   console.log(`🚀 Backend server is running on http://localhost:${port}`);
-  serve({
-    fetch: app.fetch,
-    port,
+  import('@hono/node-server').then(({ serve }) => {
+    serve({
+      fetch: app.fetch,
+      port,
+    });
+  }).catch((err) => {
+    console.error('[SERVER_START_ERROR]:', err);
   });
 }
 

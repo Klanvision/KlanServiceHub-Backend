@@ -10,6 +10,21 @@ import { signInFormSchema, signUpFormSchema } from '../schema.js';
 import { sessionMiddleware } from '../../../lib/session-middleware.js';
 import { db, formatDoc, logAudit, ensureWorkspaceDefaults } from '../../../db.js';
 import { sendOtpEmail, sendPasswordResetEmail } from '../../../lib/mail.js';
+import { getFrontendUrl } from '../../../lib/config.js';
+
+function setAuthCookie(ctx, sessionSecret) {
+  const reqUrl = ctx.req.url || '';
+  const isLocalhost = reqUrl.includes('localhost') || reqUrl.includes('127.0.0.1');
+  const isProduction = !isLocalhost;
+
+  setCookie(ctx, AUTH_COOKIE, sessionSecret, {
+    path: '/',
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: isProduction ? 'none' : 'lax',
+    maxAge: SESSION_MAX_AGE_SECONDS,
+  });
+}
 
 const app = new Hono()
   .post(
@@ -42,13 +57,10 @@ const app = new Hono()
       const { email, purpose = 'LOGIN' } = ctx.req.valid('json');
       const cleanEmail = email.toLowerCase().trim();
 
-      // If signing in with OTP, verify that the user already exists
+      // If signing in with OTP, check for suspended status
       if (purpose === 'LOGIN') {
         const user = db.prepare('SELECT id, name, email, status FROM users WHERE email = ?').get(cleanEmail);
-        if (!user) {
-          return ctx.json({ error: 'User does not exist. Please check your email or register a new account.' }, 404);
-        }
-        if (user.status === 'SUSPENDED' || user.status === 'DEACTIVATED') {
+        if (user && (user.status === 'SUSPENDED' || user.status === 'DEACTIVATED')) {
           return ctx.json({ error: 'Your account has been deactivated. Please contact support.' }, 403);
         }
       }
@@ -76,9 +88,8 @@ const app = new Hono()
         success: true,
         message: mailResult.success
           ? `Verification code sent to ${cleanEmail}`
-          : `Verification code generated for ${cleanEmail} (email delivery: ${mailResult.error || 'failed'})`,
+          : `Verification code generated for ${cleanEmail}`,
         emailSent: mailResult.success,
-        // For development/demo convenience, return simulated OTP
         simulatedOtp: otpCode,
       });
     },
@@ -153,16 +164,12 @@ const app = new Hono()
         INSERT INTO sessions (id, user_id, secret, expires_at) VALUES (?, ?, ?, ?)
       `).run(randomUUID(), user.id, sessionSecret, expiresAt);
 
-      setCookie(ctx, AUTH_COOKIE, sessionSecret, {
-        path: '/',
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: SESSION_MAX_AGE_SECONDS,
-      });
+      setAuthCookie(ctx, sessionSecret);
 
       return ctx.json({
         success: true,
+        token: sessionSecret,
+        sessionSecret,
         user: formatDoc(user),
         workspaceId: ws.id,
       });
@@ -222,7 +229,7 @@ const app = new Hono()
       VALUES (?, ?, ?, ?, 0, 0)
     `).run(randomUUID(), cleanEmail, otpHash, expiresAt);
 
-    return ctx.json({ success: true, message: `Verification code sent to ${cleanEmail}`, simulatedOtp: otpCode });
+    return ctx.json({ success: true, message: `Verification code sent to ${cleanEmail}` });
   })
   .post('/verify-email', async (ctx) => {
     const { email, code, otp } = await ctx.req.json();
@@ -280,16 +287,12 @@ const app = new Hono()
         INSERT INTO sessions (id, user_id, secret, expires_at) VALUES (?, ?, ?, ?)
       `).run(randomUUID(), userId, sessionSecret, expiresAt);
 
-      setCookie(ctx, AUTH_COOKIE, sessionSecret, {
-        path: '/',
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: SESSION_MAX_AGE_SECONDS,
-      });
+      setAuthCookie(ctx, sessionSecret);
 
       return ctx.json({
         success: true,
+        token: sessionSecret,
+        sessionSecret,
         user: { id: userId, name, email: cleanEmail, onboardingStatus: 'COMPLETED' },
         workspaceId: wsId,
       });
@@ -304,8 +307,18 @@ const app = new Hono()
       const cleanEmail = email.toLowerCase().trim();
 
       const user = db.prepare('SELECT * FROM users WHERE email = ?').get(cleanEmail);
-      if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-        return ctx.json({ error: 'Invalid email or password.' }, 400);
+      if (!user) {
+        return ctx.json({ 
+          error: 'User does not exist. Please check your email or register a new account.',
+          code: 'USER_NOT_FOUND',
+          isNewUser: true
+        }, 404);
+      }
+      if (!bcrypt.compareSync(password, user.password_hash)) {
+        return ctx.json({ 
+          error: 'Incorrect password. Please verify your password and try again.',
+          code: 'INVALID_PASSWORD' 
+        }, 401);
       }
 
       if (user.status === 'SUSPENDED' || user.status === 'DEACTIVATED') {
@@ -337,16 +350,12 @@ const app = new Hono()
         INSERT INTO sessions (id, user_id, secret, expires_at) VALUES (?, ?, ?, ?)
       `).run(randomUUID(), user.id, sessionSecret, expiresAt);
 
-      setCookie(ctx, AUTH_COOKIE, sessionSecret, {
-        path: '/',
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: SESSION_MAX_AGE_SECONDS,
-      });
+      setAuthCookie(ctx, sessionSecret);
 
       return ctx.json({ 
         success: true, 
+        token: sessionSecret,
+        sessionSecret,
         user: formatDoc(user),
         workspaceId: ws.id,
       });
@@ -423,16 +432,12 @@ const app = new Hono()
           INSERT INTO sessions (id, user_id, secret, expires_at) VALUES (?, ?, ?, ?)
         `).run(randomUUID(), user.id, sessionSecret, expiresAt);
 
-        setCookie(ctx, AUTH_COOKIE, sessionSecret, {
-          path: '/',
-          httpOnly: true,
-          secure: process.env.NODE_ENV === 'production',
-          sameSite: 'lax',
-          maxAge: SESSION_MAX_AGE_SECONDS,
-        });
+        setAuthCookie(ctx, sessionSecret);
 
         return ctx.json({
           success: true,
+          token: sessionSecret,
+          sessionSecret,
           user: formatDoc(user),
           workspaceId: ws.id,
           provider,
@@ -477,7 +482,7 @@ const app = new Hono()
 
       console.log(`[KLANSERVICEHUB RESET OTP] Password reset code for ${cleanEmail}: ${otpCode}`);
 
-      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+      const frontendUrl = getFrontendUrl(ctx);
       const resetUrl = `${frontendUrl}/reset-password?token=${token}&email=${encodeURIComponent(cleanEmail)}`;
 
       const mailResult = await sendPasswordResetEmail({
@@ -491,10 +496,9 @@ const app = new Hono()
         success: true,
         message: mailResult.success
           ? `Password reset code and link sent to ${cleanEmail}`
-          : `Reset code generated for ${cleanEmail} (email delivery: ${mailResult.error || 'Check SMTP configuration'})`,
+          : `Password reset request registered for ${cleanEmail}`,
         emailSent: mailResult.success,
         token,
-        simulatedOtp: otpCode,
         resetUrl,
       });
     },
@@ -514,11 +518,11 @@ const app = new Hono()
 
       const reset = db.prepare(`
         SELECT * FROM password_resets 
-        WHERE email = ? AND used = 0 AND datetime(expires_at) > datetime('now')
+        WHERE email = ? AND used = 0
         ORDER BY created_at DESC LIMIT 1
       `).get(cleanEmail);
 
-      if (!reset) {
+      if (!reset || (reset.expires_at && new Date(reset.expires_at).getTime() < Date.now())) {
         return ctx.json({ error: 'Reset code has expired or is invalid. Please request a new code.' }, 400);
       }
 
@@ -557,11 +561,11 @@ const app = new Hono()
 
       const reset = db.prepare(`
         SELECT * FROM password_resets 
-        WHERE email = ? AND used = 0 AND datetime(expires_at) > datetime('now')
+        WHERE email = ? AND used = 0
         ORDER BY created_at DESC LIMIT 1
       `).get(cleanEmail);
 
-      if (!reset) {
+      if (!reset || (reset.expires_at && new Date(reset.expires_at).getTime() < Date.now())) {
         return ctx.json({ error: 'Password reset request has expired or is invalid. Please request a new code.' }, 400);
       }
 
@@ -595,13 +599,7 @@ const app = new Hono()
         INSERT INTO sessions (id, user_id, secret, expires_at) VALUES (?, ?, ?, ?)
       `).run(randomUUID(), reset.user_id, sessionSecret, sessionExpires);
 
-      setCookie(ctx, AUTH_COOKIE, sessionSecret, {
-        path: '/',
-        httpOnly: true,
-        secure: process.env.NODE_ENV === 'production',
-        sameSite: 'lax',
-        maxAge: SESSION_MAX_AGE_SECONDS,
-      });
+      setAuthCookie(ctx, sessionSecret);
 
       // Find user's workspace
       const ws = db.prepare(`
@@ -614,6 +612,8 @@ const app = new Hono()
       return ctx.json({
         success: true,
         message: 'Password reset successfully!',
+        token: sessionSecret,
+        sessionSecret,
         workspaceId: ws?.id,
       });
     },
