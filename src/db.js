@@ -2,6 +2,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'node:crypto';
 
+// Cloudflare Workers deploy: node:sqlite resolved dynamically at runtime (no static import)
 // Dynamically resolve DatabaseSync in Node.js runtime without breaking Cloudflare Workers bundler
 let DatabaseSync = null;
 try {
