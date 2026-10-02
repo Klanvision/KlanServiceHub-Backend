@@ -12,8 +12,8 @@ database_id = "e4065dbf-b85b-4d17-8334-f07f19109c70"
 # Environment Variables for Cloudflare Worker
 [vars]
 PORT = "5000"
-FRONTEND_URL = "https://klanservicehub-frontend.pages.dev"
-NEXT_PUBLIC_APP_BASE_URL = "https://klanservicehub-frontend.pages.dev"
+FRONTEND_URL = "https://klanservicehub-frontend.klanservicehub.workers.dev"
+NEXT_PUBLIC_APP_BASE_URL = "https://klanservicehub-frontend.klanservicehub.workers.dev"
 D1_DATABASE_NAME = "klanservicehub_db"
 
 # Email / SMTP Configuration

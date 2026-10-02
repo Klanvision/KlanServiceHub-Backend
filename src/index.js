@@ -56,11 +56,27 @@ const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:3000';
 app.use(
   '/api/*',
   cors({
-    origin: (origin) => {
-      if (!origin || origin === allowedOrigin || origin.startsWith('http://localhost:')) {
-        return origin || allowedOrigin;
+    origin: (origin, c) => {
+      const configuredOrigin = c?.env?.FRONTEND_URL || process.env.FRONTEND_URL;
+      const allowedOrigins = [
+        configuredOrigin,
+        'https://klanservicehub-frontend.klanservicehub.workers.dev',
+        'https://klanservicehub-frontend.pages.dev',
+      ].filter(Boolean);
+
+      if (!origin) {
+        return allowedOrigins[0] || 'http://localhost:3000';
       }
-      return allowedOrigin;
+      if (
+        origin.startsWith('http://localhost:') ||
+        origin.startsWith('http://127.0.0.1:') ||
+        allowedOrigins.includes(origin) ||
+        origin.endsWith('.klanservicehub.workers.dev') ||
+        origin.endsWith('.pages.dev')
+      ) {
+        return origin;
+      }
+      return allowedOrigins[0] || origin;
     },
     credentials: true,
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
