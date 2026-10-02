@@ -2,6 +2,17 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'node:crypto';
 
+// Suppress Node.js experimental warning for built-in SQLite in local development
+if (typeof process !== 'undefined' && typeof process.emit === 'function') {
+  const originalEmit = process.emit;
+  process.emit = function (name, data, ...rest) {
+    if (name === 'warning' && data && (data.name === 'ExperimentalWarning' || String(data.message || '').includes('SQLite is an experimental feature'))) {
+      return false;
+    }
+    return originalEmit.apply(process, [name, data, ...rest]);
+  };
+}
+
 // Cloudflare Workers deploy: node:sqlite resolved dynamically at runtime (no static import)
 // Dynamically resolve DatabaseSync in Node.js runtime without breaking Cloudflare Workers bundler
 let DatabaseSync = null;

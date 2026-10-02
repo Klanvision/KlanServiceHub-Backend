@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch src/index.js",
-    "start": "node src/index.js",
+    "dev": "node --no-warnings --watch src/index.js",
+    "start": "node --no-warnings src/index.js",
     "deploy": "npx wrangler@4 deploy",
     "d1:create": "npx wrangler d1 create klanservicehub_db",
     "d1:init:local": "npx wrangler d1 execute klanservicehub_db --local --file=cloudflare-d1-schema.sql",
