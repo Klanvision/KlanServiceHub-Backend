@@ -2,9 +2,10 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "klanservicehub-backend",
   "main": "src/index.js",
-  "compatibility_date": "2025-04-01",
+  "compatibility_date": "2026-10-01",
   "compatibility_flags": [
-    "nodejs_compat"
+    "nodejs_compat",
+    "enable_nodejs_sqlite_module"
   ],
   "d1_databases": [
     {
