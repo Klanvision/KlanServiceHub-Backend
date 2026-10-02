@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 
 async function runMasterE2ETestSuite() {
   console.log('========================================================================');
-  console.log('🚀 MASTER ENTERPRISE TICKETING PLATFORM COMPREHENSIVE VERIFICATION SUITE');
+  console.log('🚀 MASTER ENTERPRISE JIRA CLONE COMPREHENSIVE VERIFICATION SUITE');
   console.log('========================================================================\n');
 
   let passed = 0;
@@ -93,11 +93,7 @@ async function runMasterE2ETestSuite() {
     method: 'POST',
     body: JSON.stringify({ name: 'Bob Developer', email: newEmail, password: 'Password@123' }),
   });
-  assert(
-    res.status === 200 &&
-    (res.data.user.onboardingStatus === 'COMPLETED' || res.data.user.onboardingStatus === 'ACCOUNT_CREATED'),
-    'Account Registration (COMPLETED)'
-  );
+  assert(res.status === 200 && res.data.user.onboardingStatus === 'ACCOUNT_CREATED', 'Account Registration (ACCOUNT_CREATED)');
 
   // [2. Organization Profile & Ownership Transfer]
   console.log('\n--- [2. Company Profile Management & Ownership Transfer] ---');
@@ -317,11 +313,7 @@ async function runMasterE2ETestSuite() {
     method: 'POST',
     body: JSON.stringify({ name: 'CI Token', scopes: ['*'], expiresDays: 30 }),
   });
-  assert(
-    res.status === 200 &&
-    (res.data.data.cleartextToken.startsWith('klanservicehub_live_') || res.data.data.cleartextToken.startsWith('jira_live_')),
-    'Generate Masked Scoped API Token'
-  );
+  assert(res.status === 200 && res.data.data.cleartextToken.startsWith('jira_live_'), 'Generate Masked Scoped API Token');
 
   res = await request(`/api/security/${wsId}`);
   assert(res.status === 200 && res.data.data.policy !== undefined, 'Query Security Policies');
