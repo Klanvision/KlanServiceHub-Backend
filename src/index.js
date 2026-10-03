@@ -56,27 +56,11 @@ const allowedOrigin = process.env.FRONTEND_URL || 'http://localhost:3000';
 app.use(
   '/api/*',
   cors({
-    origin: (origin, c) => {
-      const configuredOrigin = c?.env?.FRONTEND_URL || process.env.FRONTEND_URL;
-      const allowedOrigins = [
-        configuredOrigin,
-        'https://klanservicehub-frontend.klanservicehub.workers.dev',
-        'https://klanservicehub-frontend.pages.dev',
-      ].filter(Boolean);
-
-      if (!origin) {
-        return allowedOrigins[0] || 'http://localhost:3000';
+    origin: (origin) => {
+      if (!origin || origin === allowedOrigin || origin.startsWith('http://localhost:')) {
+        return origin || allowedOrigin;
       }
-      if (
-        origin.startsWith('http://localhost:') ||
-        origin.startsWith('http://127.0.0.1:') ||
-        allowedOrigins.includes(origin) ||
-        origin.endsWith('.klanservicehub.workers.dev') ||
-        origin.endsWith('.pages.dev')
-      ) {
-        return origin;
-      }
-      return allowedOrigins[0] || origin;
+      return allowedOrigin;
     },
     credentials: true,
     allowMethods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -181,15 +165,9 @@ import { backfillProjectAndTaskKeys } from './lib/issue-key.js';
 backfillProjectAndTaskKeys();
 
 const port = Number(process?.env?.PORT) || 5000;
-const isDirectRun =
-  typeof process !== 'undefined' &&
-  Array.isArray(process?.argv) &&
-  process.argv[1] &&
-  (process.argv[1].endsWith('index.js') ||
-    process.argv[1].endsWith('src/index.js') ||
-    process.argv[1].endsWith('src\\index.js'));
+const isDirectRun = typeof process !== 'undefined' && Array.isArray(process.argv) && process.argv[1] && (process.argv[1].endsWith('index.js') || process.argv[1].endsWith('src/index.js') || process.argv[1].endsWith('src\\index.js'));
 
-if (isDirectRun && process?.env?.TEST_MODE !== 'true') {
+if (isDirectRun && process.env.TEST_MODE !== 'true') {
   console.log(`🚀 Backend server is running on http://localhost:${port}`);
   serve({
     fetch: app.fetch,

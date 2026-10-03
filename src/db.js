@@ -1,83 +1,24 @@
+import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
+import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { randomUUID } from 'node:crypto';
 
-// Dynamically resolve DatabaseSync in Node.js runtime without breaking Cloudflare Workers bundler
-let DatabaseSync = null;
-try {
-  if (typeof process !== 'undefined' && typeof process.getBuiltinModule === 'function') {
-    const sqlite = process.getBuiltinModule('node:sqlite');
-    if (sqlite?.DatabaseSync) {
-      DatabaseSync = sqlite.DatabaseSync;
-    }
-  }
-} catch (e) {
-  // Ignored in environments without process.getBuiltinModule
-}
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const dbPath = path.resolve(__dirname, '../jira.db');
 
-if (!DatabaseSync) {
-  try {
-    const sqliteModuleId = 'node:sqlite';
-    const sqlite = await import(/* @vite-ignore */ sqliteModuleId);
-    DatabaseSync = sqlite?.DatabaseSync || sqlite?.default?.DatabaseSync || null;
-  } catch (e) {
-    // Expected in Cloudflare Workers / workerd environment
-  }
-}
+export const db = new DatabaseSync(dbPath);
 
-// Universal database path resolution (works on Node.js and Cloudflare Workers)
-let databaseInstance = null;
-
-try {
-  let dbPath = 'jira.db';
-  if (typeof process !== 'undefined' && process && typeof process.cwd === 'function') {
-    dbPath = path.resolve(process.cwd(), 'jira.db');
-  }
-  if (typeof DatabaseSync === 'function') {
-    databaseInstance = new DatabaseSync(dbPath);
-  }
-} catch (e) {
-  try {
-    if (typeof DatabaseSync === 'function') {
-      databaseInstance = new DatabaseSync(':memory:');
-    }
-  } catch (err) {
-    // Running in Cloudflare edge worker isolate
-  }
-}
-
-// Fallback proxy to ensure db is NEVER undefined during edge bundle evaluation
-if (!databaseInstance || typeof databaseInstance.exec !== 'function') {
-  databaseInstance = {
-    exec: () => {},
-    prepare: (sql) => ({
-      all: () => [],
-      get: () => null,
-      run: () => ({ changes: 0, lastInsertRowid: 0 }),
-    }),
-  };
-}
-
-export const db = databaseInstance;
-
-// Enable WAL mode, busy timeout, and foreign keys safely
-try {
-  if (db && typeof db.exec === 'function') {
-    db.exec('PRAGMA journal_mode = WAL;');
-    db.exec('PRAGMA synchronous = NORMAL;');
-    db.exec('PRAGMA busy_timeout = 5000;');
-    db.exec('PRAGMA foreign_keys = ON;');
-  }
-} catch (e) {
-  // Edge runtime memory DB compatibility
-}
+// Enable WAL mode, busy timeout, and foreign keys
+db.exec('PRAGMA journal_mode = WAL;');
+db.exec('PRAGMA synchronous = NORMAL;');
+db.exec('PRAGMA busy_timeout = 5000;');
+db.exec('PRAGMA foreign_keys = ON;');
 
 // Helper to safely add column if it doesn't exist
 function safeAddColumn(table, columnDef) {
   try {
-    if (db && typeof db.exec === 'function') {
-      db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef};`);
-    }
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${columnDef};`);
   } catch (e) {
     // Column likely already exists, ignore
   }
@@ -85,9 +26,7 @@ function safeAddColumn(table, columnDef) {
 
 // Initialize tables from schema
 const initSchema = () => {
-  try {
-    if (db && typeof db.exec === 'function') {
-      db.exec(`
+  db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -1082,7 +1021,6 @@ const initSchema = () => {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
   `);
-    }
 
   // Run safe column additions for existing tables
   safeAddColumn('users', "avatar_url TEXT");
@@ -1156,9 +1094,6 @@ const initSchema = () => {
   safeAddColumn('groups', "role_mapping TEXT DEFAULT 'MEMBER'");
 
   seedDefaultPermissions();
-  } catch (e) {
-    // Cloudflare edge D1 migration safe
-  }
 };
 
 // Comprehensive Standard permissions catalogue (72 Granular Permissions)
@@ -1294,19 +1229,13 @@ export const SYSTEM_PERMISSIONS = [
 ];
 
 function seedDefaultPermissions() {
-  try {
-    if (db && typeof db.prepare === 'function') {
-      const insertPerm = db.prepare(`
-        INSERT OR REPLACE INTO permissions (id, code, name, category, description)
-        VALUES (?, ?, ?, ?, ?)
-      `);
+  const insertPerm = db.prepare(`
+    INSERT OR REPLACE INTO permissions (id, code, name, category, description)
+    VALUES (?, ?, ?, ?, ?)
+  `);
 
-      for (const p of SYSTEM_PERMISSIONS) {
-        insertPerm.run(p.code, p.code, p.name, p.category, p.description);
-      }
-    }
-  } catch (e) {
-    // Cloudflare edge D1 migration safe
+  for (const p of SYSTEM_PERMISSIONS) {
+    insertPerm.run(p.code, p.code, p.name, p.category, p.description);
   }
 }
 
@@ -1614,11 +1543,7 @@ export function triggerAutomations({ workspaceId, triggerEvent, context = {} }) 
   }
 }
 
-try {
-  initSchema();
-} catch (e) {
-  // Edge runtime schema is managed via Cloudflare D1 SQL migrations
-}
+initSchema();
 
 // Auto-seed default dashboards if not present
 try {
@@ -1663,9 +1588,9 @@ try {
     },
   ];
 
-  const wsList = db.prepare('SELECT id, user_id FROM workspaces').all() || [];
+  const wsList = db.prepare('SELECT id, user_id FROM workspaces').all();
   for (const ws of wsList) {
-    const existing = db.prepare('SELECT COUNT(*) as c FROM dashboards WHERE workspace_id = ?').get(ws.id)?.c ?? 0;
+    const existing = db.prepare('SELECT COUNT(*) as c FROM dashboards WHERE workspace_id = ?').get(ws.id).c;
     if (existing === 0) {
       for (const tpl of DEFAULT_DASH_TPLS) {
         const dashId = randomUUID();

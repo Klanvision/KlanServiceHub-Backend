@@ -1,1 +1,0 @@
-This folder contains the built output assets for the worker "klanservicehub-backend" generated at 2026-10-02T09:16:59.226Z.
