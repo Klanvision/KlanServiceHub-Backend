@@ -9,12 +9,21 @@ binding = "DB"
 database_name = "klanservicehub_db"
 database_id = "e4065dbf-b85b-4d17-8334-f07f19109c70"
 
+[observability]
+enabled = true
+
 # Environment Variables for Cloudflare Worker
 [vars]
 PORT = "5000"
 FRONTEND_URL = "https://klanservicehub-frontend.klanservicehub.workers.dev"
 NEXT_PUBLIC_APP_BASE_URL = "https://klanservicehub-frontend.klanservicehub.workers.dev"
 D1_DATABASE_NAME = "klanservicehub_db"
+D1_DATABASE_ID = "e4065dbf-b85b-4d17-8334-f07f19109c70"
+
+# Appwrite Configuration
+NEXT_PUBLIC_APPWRITE_ENDPOINT = "https://cloud.appwrite.io/v1"
+NEXT_APPWRITE_KEY = "f8178928-9d89-4d25-ab87-8a297146658f"
+NEXT_PUBLIC_APPWRITE_DATABASE_ID = "jira_db"
 
 # Email / SMTP Configuration
 SMTP_HOST = "smtp.gmail.com"
